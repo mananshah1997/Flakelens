@@ -44,5 +44,5 @@ pip install -r requirements.txt
 
 **3. Configure Environment Variables:**
 Create a file named .env in the root directory of the project and add your Grafana credentials:
-GRAFANA_URL=[https://your-company.grafana.net](https://your-company.grafana.net)
-GRAFANA_TOKEN=<your_api_token_here>
+* GRAFANA_URL=[https://your-company.grafana.net](https://your-company.grafana.net)
+* GRAFANA_TOKEN=<your_api_token_here>
