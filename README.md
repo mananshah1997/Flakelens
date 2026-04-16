@@ -35,10 +35,12 @@ Before you begin, ensure you have met the following requirements:
 ```bash
 git clone [https://github.com/yourusername/flakelens.git](https://github.com/yourusername/flakelens.git)
 cd flakelens
+```
 
 **2. Install dependencies:**
 ```bash
 pip install -r requirements.txt
+```
 
 **3. Configure Environment Variables:**
 Create a file named .env in the root directory of the project and add your Grafana credentials:
