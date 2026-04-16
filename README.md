@@ -1,0 +1,1 @@
+This tool will give you all the grafana dashboards using a particular snowflake table if you provide the snowflake table name to it. And it will give you all the tables used in a particular dashboard if you provide the dashboard name to it.
