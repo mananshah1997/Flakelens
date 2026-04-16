@@ -1,0 +1,4 @@
+sqlglot
+requests
+python-dotenv
+customtkinter
