@@ -25,7 +25,6 @@ Built with a sleek dark-mode UI, FlakeLens fetches your dashboards, parses the r
 Before you begin, ensure you have met the following requirements:
 * **Python 3.8** or higher installed.
 * A **Grafana API Token** (Viewer access is sufficient).
-* Dashboards stored in folders named `PRODUCTION` or `ProdTech` (this can be customized in the code).
 
 ---
 
