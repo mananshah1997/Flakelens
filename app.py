@@ -245,8 +245,13 @@ class FlakeLensApp(ctk.CTk):
             "   the toggle switch.\n\n"
             "3. Enter a Table or Dashboard\n"
             "   name and press Search.\n\n"
-            "4. Click the ▶ arrows to expand\n"
-            "   the results."
+            "4. For 'Find Dashboards from Table':\n"
+            "   You can optionally choose to\n"
+            "   lookup by column/s and then Search.\n"
+            "   Format - 'A','B','C'\n\n"
+            "5. Click the ▶ arrows to expand\n"
+            "   the results.\n\n"
+            "6. Optional - Export CSV\n\n"
         )
 
         self.guide_label = ctk.CTkLabel(
