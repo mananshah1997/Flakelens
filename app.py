@@ -1,11 +1,12 @@
 #Author: Manan Tarun Shah - Production Technology
-#Co-author: Gemini
 
 import os
 import re
 import requests
 import threading
 import concurrent.futures
+import csv
+from tkinter import filedialog
 import customtkinter as ctk
 from collections import defaultdict
 from typing import Dict, List, Set, Tuple, Callable, Optional
@@ -40,20 +41,27 @@ class GrafanaLineageMapper:
             "Content-Type": "application/json"
         })
         
-        # Structure 1: table_name -> { dashboard_string: set(panel_or_variable_names) }
+        # Structure 1: table_name -> { dashboard_string: set( (panel_or_variable_names, raw_sql) ) }
         self.table_to_dashboards_map = defaultdict(lambda: defaultdict(set))
         # Structure 2: dashboard_string -> { panel_or_variable_name: set(table_names) }
         self.dashboard_to_tables_map = defaultdict(lambda: defaultdict(set))
 
-    def fetch_dashboard_metadata(self, target_folders: List[str]) -> List[Tuple[str, str, str]]:
-        """Fetches a list of (uid, title, folderTitle) for dashboards in target folders."""
+    def fetch_dashboard_metadata(self, target_folders: Optional[List[str]] = None) -> List[Tuple[str, str, str]]:
+        """Fetches a list of (uid, title, folderTitle) for dashboards. If target_folders is None/empty, fetches all."""
         print(f"DEBUG: Fetching dashboards from Grafana URL: {self.grafana_url}")
         response = self.session.get(f"{self.grafana_url}/api/search?type=dash-db")
         response.raise_for_status()
         all_dashboards = response.json()
         
-        print(f"DEBUG: Found {len(all_dashboards)} total dashboards in Grafana.")
-        
+        # NORMALIZE: If no specific folders are requested, return all of them
+        if not target_folders:
+            filtered_dashboards = [
+                (dash['uid'], dash['title'], dash.get('folderTitle', 'General')) 
+                for dash in all_dashboards 
+            ]
+            print(f"DEBUG: Processing all {len(filtered_dashboards)} dashboards across all folders.")
+            return filtered_dashboards
+
         target_folders_set = {folder.upper() for folder in target_folders}
         filtered_dashboards = [
             (dash['uid'], dash['title'], dash.get('folderTitle', 'General')) 
@@ -95,7 +103,6 @@ class GrafanaLineageMapper:
                     continue
                     
                 # NORMALIZE: Drop the catalog (database) and only keep schema and table name
-                # This merges US_OPS_ANALYTICS.DELIVERY_LIST.ODL_ER down to DELIVERY_LIST.ODL_ER
                 sql_parts = [part for part in (table_node.db, table_node.name) if part]
                 if sql_parts:
                     extracted_tables.add('.'.join(sql_parts).upper())
@@ -116,7 +123,7 @@ class GrafanaLineageMapper:
                     
         return extracted_tables
 
-    def build_dependency_maps(self, target_folders: List[str], progress_callback: Optional[Callable] = None) -> None:
+    def build_dependency_maps(self, target_folders: Optional[List[str]] = None, progress_callback: Optional[Callable] = None) -> None:
         """Iterates through dashboards and populates both directional dependency maps."""
         dashboard_list = self.fetch_dashboard_metadata(target_folders)
         total_dashboards = len(dashboard_list)
@@ -161,18 +168,18 @@ class GrafanaLineageMapper:
             
             for sql_query, ui_source_label in extracted_queries_with_context:
                 for table_name in self.extract_table_names_from_sql(sql_query):
-                    analyzed_results.append((table_name, formatted_dashboard_name, ui_source_label))
+                    analyzed_results.append((table_name, formatted_dashboard_name, ui_source_label, sql_query))
             
             return analyzed_results
 
         dashboards_completed = 0
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as thread_executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as thread_executor:
             pending_futures = {thread_executor.submit(analyze_dashboard_queries, dash): dash for dash in dashboard_list}
             
             for future in concurrent.futures.as_completed(pending_futures):
                 try:
-                    for table_name, dashboard_name, source_label in future.result(timeout=15):
-                        self.table_to_dashboards_map[table_name][dashboard_name].add(source_label)
+                    for table_name, dashboard_name, source_label, sql_query in future.result(timeout=15):
+                        self.table_to_dashboards_map[table_name][dashboard_name].add((source_label, sql_query))
                         self.dashboard_to_tables_map[dashboard_name][source_label].add(table_name)
                 except Exception as e:
                     failed_dash = pending_futures[future]
@@ -201,9 +208,14 @@ class FlakeLensApp(ctk.CTk):
         
         # UI Tracking Variables
         self.search_text_var = ctk.StringVar()
+        self.column_input_var = ctk.StringVar()
         self.suggestion_frame = None
-        self.is_selecting_suggestion = False  # Prevents infinite loops when a suggestion is clicked
-        self.is_loading = False # Flags for animation
+        self.is_selecting_suggestion = False  
+        self.is_loading = False 
+        
+        # Export Tracking Variables
+        self.current_search_results = []
+        self.current_searched_term = ""
         
         # Caching lists for fast autocomplete
         self.all_dashboard_names = []
@@ -246,14 +258,17 @@ class FlakeLensApp(ctk.CTk):
         )
         self.guide_label.grid(row=4, column=0, padx=20, sticky="w")
 
+        # --- Note Section ---
         self.note_header = ctk.CTkLabel(self.sidebar_frame, text="NOTE:", font=ctk.CTkFont(size=14, weight="bold"))
         self.note_header.grid(row=5, column=0, padx=20, pady=(20,5), sticky="w")
 
-        note_instructions = ("All Snowflake tables will be\n" 
-                             "displayed in the format SCHEMA.TABLE,\n" 
-                             "even if they are in the format\n" 
-                             "DATABASE.SCHEMA.TABLE in the \n"
-                             "grafana panel query.")
+        note_instructions = (
+            "All Snowflake tables will be\n" 
+            "displayed in the format SCHEMA.TABLE,\n" 
+            "even if they are in the format\n" 
+            "DATABASE.SCHEMA.TABLE in the \n"
+            "grafana panel query."
+        )
         
         self.note_label = ctk.CTkLabel(
             self.sidebar_frame, 
@@ -297,25 +312,46 @@ class FlakeLensApp(ctk.CTk):
         self.search_mode_toggle.grid(row=2, column=0, sticky="ew", pady=(0, 20))
         self.search_mode_toggle.set(self.current_mode)
 
-        # Search Bar Area
+        # --- Dynamic Search Bar Area ---
         self.search_input_container = ctk.CTkFrame(self.main_content_frame, fg_color="transparent")
         self.search_input_container.grid(row=3, column=0, sticky="ew", pady=(0, 10))
-        self.search_input_container.grid_columnconfigure(0, weight=1)
+        self.search_input_container.grid_columnconfigure(1, weight=1)
 
-        # The entry field mapped to the string var
+        # Row 0: Table / Dashboard Primary Search
+        self.search_label = ctk.CTkLabel(self.search_input_container, text="Table Name:", font=ctk.CTkFont(weight="bold", size=13))
+        self.search_label.grid(row=0, column=0, padx=(0, 10), sticky="e")
+
         self.search_input_entry = ctk.CTkEntry(
             self.search_input_container, 
-            textvariable=self.search_text_var, 
+            textvariable=self.search_text_var,
             height=45
         )
-        self.search_input_entry.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+        self.search_input_entry.grid(row=0, column=1, sticky="ew", padx=(0, 10))
         self.search_input_entry.bind("<Return>", self.process_search_request)
         self.search_input_entry.configure(state="disabled")
 
-        self.execute_search_button = ctk.CTkButton(self.search_input_container, text="Search", height=45, command=self.process_search_request, state="disabled")
-        self.execute_search_button.grid(row=0, column=1)
+        self.execute_search_button = ctk.CTkButton(self.search_input_container, text="Search", height=45, width=90, command=self.process_search_request, state="disabled")
+        self.execute_search_button.grid(row=0, column=2, padx=(0, 10))
 
-        # Attach the live typing event listener for suggestions
+        self.export_csv_button = ctk.CTkButton(self.search_input_container, text="Export CSV", height=45, width=90, command=self.export_to_csv, state="disabled", fg_color="#27AE60", hover_color="#2ECC71")
+        self.export_csv_button.grid(row=0, column=3)
+
+        # Row 2: Column Search (Row 1 reserved for dynamic dropdown)
+        self.column_label = ctk.CTkLabel(self.search_input_container, text="Lookup by Column (Optional):", font=ctk.CTkFont(weight="bold", size=13))
+        self.column_label.grid(row=2, column=0, padx=(0, 10), pady=(10, 0), sticky="e")
+
+        self.column_input_entry = ctk.CTkEntry(
+            self.search_input_container, 
+            textvariable=self.column_input_var,
+            height=35
+        )
+        self.column_input_entry.grid(row=2, column=1, sticky="ew", padx=(0, 10), pady=(10, 0))
+        self.column_input_entry.bind("<Return>", self.process_search_request)
+
+        self.grid_placeholder = ctk.CTkLabel(self.search_input_container, text="", width=90)
+        self.grid_placeholder.grid(row=2, column=3)
+
+        # Attach the live typing event listener
         self.search_text_var.trace_add("write", self.handle_typing_suggestions)
 
         # --- ENHANCED LOADING UI ---
@@ -323,25 +359,20 @@ class FlakeLensApp(ctk.CTk):
         self.loading_container.grid(row=4, column=0, sticky="ew", pady=(20, 10))
         self.loading_container.grid_columnconfigure(0, weight=1)
 
-        # Title
         self.loading_title = ctk.CTkLabel(self.loading_container, text="Syncing Grafana & Snowflake Lineage...", font=ctk.CTkFont(size=14, weight="bold"))
         self.loading_title.grid(row=0, column=0, sticky="w", pady=(0, 8))
 
-        # Thicker, greener progress bar
         self.loading_progress_bar = ctk.CTkProgressBar(self.loading_container, height=12, progress_color="#2ECC71") 
         self.loading_progress_bar.grid(row=1, column=0, sticky="ew")
         self.loading_progress_bar.set(0)
 
-        # Container for the legends (Percentage left, Count right)
         self.loading_legends_frame = ctk.CTkFrame(self.loading_container, fg_color="transparent")
         self.loading_legends_frame.grid(row=2, column=0, sticky="ew", pady=(5, 0))
         self.loading_legends_frame.grid_columnconfigure(1, weight=1)
 
-        # 0% text
         self.loading_percent_label = ctk.CTkLabel(self.loading_legends_frame, text="0%", font=ctk.CTkFont(size=13, weight="bold"), text_color="#2ECC71")
         self.loading_percent_label.grid(row=0, column=0, sticky="w")
 
-        # 0 / 0 text
         self.loading_detail_label = ctk.CTkLabel(self.loading_legends_frame, text="0 / 0 dashboards processed", font=ctk.CTkFont(size=12), text_color="gray60")
         self.loading_detail_label.grid(row=0, column=1, sticky="e")
 
@@ -354,7 +385,7 @@ class FlakeLensApp(ctk.CTk):
         self.active_results_frame = self.results_frame_dashboards
         self.active_results_frame.grid(row=5, column=0, sticky="nsew", pady=(10, 0))
 
-        # --- Bind global click to detect background clicks ---
+        # Bind global click to detect background clicks
         self.bind_all("<Button-1>", self.handle_background_click)
 
         # Start mapping thread and animation loop
@@ -362,32 +393,56 @@ class FlakeLensApp(ctk.CTk):
         self.animate_loading_spinner()
         threading.Thread(target=self.initialize_and_build_maps, daemon=True).start()
 
+    def export_to_csv(self):
+        """Prompts the user to save the current search results to a CSV file."""
+        if not self.current_search_results:
+            return
+
+        safe_term = re.sub(r'[\\/*?:"<>|]', "", self.current_searched_term)
+        default_filename = f"FlakeLens_Export_{safe_term}.csv"
+
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv")],
+            title="Save Search Results",
+            initialfile=default_filename
+        )
+
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, mode='w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                if self.current_mode == "Find Dashboards from Table":
+                    writer.writerow(["Table Name", "Dashboard Name", "Panel/Variable Name"])
+                else:
+                    writer.writerow(["Dashboard Name", "Panel/Variable Name", "Table Name"])
+                
+                unique_results = sorted(list(set(tuple(row) for row in self.current_search_results)))
+                writer.writerows(unique_results)
+        except Exception as e:
+            print(f"DEBUG: Failed to export CSV: {e}")
+
     def animate_loading_spinner(self, frame_index=0):
-        """Creates a text-based animation loop for the sidebar loading status."""
         if not self.is_loading:
-            return  # Stop the loop if loading has finished or failed
-            
+            return  
         spinners = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
         self.status_indicator_label.configure(text=f"{spinners[frame_index]} Loading...", text_color="#FFCC00")
-        
-        # Schedule the next frame in 80 milliseconds
         self.after(80, self.animate_loading_spinner, (frame_index + 1) % len(spinners))
 
     def handle_typing_suggestions(self, *args):
-        """Monitors keystrokes and displays relevant dropdown suggestions."""
+        """Monitors keystrokes and displays dropdown suggestions."""
         if self.is_selecting_suggestion:
-            return  # Ignore the trace if the code itself is setting the text
+            return  
 
         self.hide_suggestion_frame()
         raw_search_term = self.search_text_var.get().strip().upper()
 
-        # Require at least 2 characters to trigger autocomplete
         if len(raw_search_term) < 2:
             return
 
-        # Determine which list to filter
         if self.current_mode == "Find Dashboards from Table":
-            # NORMALIZE USER INPUT: Drop DB prefix for autocomplete filtering
             parts = raw_search_term.split('.')
             search_term = '.'.join(parts[-2:])
             matches = [t for t in self.all_table_names if search_term in t]
@@ -398,18 +453,16 @@ class FlakeLensApp(ctk.CTk):
         if not matches:
             return
 
-        # Cap at top 15 results to prevent CustomTkinter from lagging
         matches = matches[:10]
 
-        # Build the dynamic suggestion dropdown frame
+        # BUILD DROPDOWN
         self.suggestion_frame = ctk.CTkScrollableFrame(
             self.search_input_container, 
-            height=min(len(matches) * 35, 200), # Auto-size height based on content
+            height=min(len(matches) * 35, 200),
             fg_color=("gray90", "gray15"),
             corner_radius=4
         )
-        # Place it strictly under the input bar in column 0
-        self.suggestion_frame.grid(row=1, column=0, sticky="ew", padx=(0, 10), pady=(2, 0))
+        self.suggestion_frame.grid(row=1, column=1, sticky="ew", padx=(0, 10), pady=(2, 0))
 
         for match in matches:
             btn = ctk.CTkButton(
@@ -425,26 +478,19 @@ class FlakeLensApp(ctk.CTk):
             btn.pack(fill="x", pady=1)
 
     def select_suggestion(self, match: str):
-        """Populates the search bar and executes the search when a suggestion is clicked."""
-        # Turn on the flag to prevent the typing trace from firing
+        """Populates the search bar and cleans up UI without auto-searching."""
         self.is_selecting_suggestion = True
         self.search_text_var.set(match)
-        
-        # Delay the destruction of the frame by 50ms so the button's click event can finish cleanly
         self.after(50, self._finalize_selection)
 
     def _finalize_selection(self):
-        """Executes the search and cleans up the UI after a short delay."""
+        """Cleans up the UI after a suggestion is selected."""
         self.hide_suggestion_frame()
-        self.process_search_request()
-        # Safe to unlock the typing trace again
         self.is_selecting_suggestion = False
 
     def hide_suggestion_frame(self):
-        """Cleans up and destroys the temporary suggestion box."""
         if hasattr(self, 'suggestion_frame') and self.suggestion_frame is not None:
             try:
-                # Always remove from the grid BEFORE destroying to prevent visual glitches
                 self.suggestion_frame.grid_forget() 
                 self.suggestion_frame.destroy()
             except Exception:
@@ -452,23 +498,17 @@ class FlakeLensApp(ctk.CTk):
             self.suggestion_frame = None
 
     def handle_background_click(self, event):
-        """Detects clicks outside the search entry and suggestion pane to close suggestions."""
         if not hasattr(self, 'suggestion_frame') or self.suggestion_frame is None:
             return
-
-        # Get the underlying tk widget string paths
         clicked_widget_str = str(event.widget)
         entry_widget_str = str(self.search_input_entry)
         suggestion_frame_str = str(self.suggestion_frame)
 
-        # If the clicked widget is NOT the entry bar and NOT part of the suggestion frame
         if not clicked_widget_str.startswith(entry_widget_str) and not clicked_widget_str.startswith(suggestion_frame_str):
             self.hide_suggestion_frame()
-            # Optionally set focus to the main app window to fully clear the entry focus
             self.focus_set()
 
     def handle_search_mode_switch(self, selected_mode: str):
-        """Swaps active frames and manages state preservation when toggling modes."""
         self.hide_suggestion_frame()
         
         if not selected_mode:
@@ -478,42 +518,49 @@ class FlakeLensApp(ctk.CTk):
         if selected_mode == self.current_mode:
             return 
             
-        # 1. Save current text state
         self.search_text_state[self.current_mode] = self.search_text_var.get()
         self.current_mode = selected_mode
         self.active_results_frame.grid_forget() 
         
-        # 2. Swap result frames
         if self.current_mode == "Find Dashboards from Table":
+            self.search_label.configure(text="Table Name:")
             self.active_results_frame = self.results_frame_dashboards
+            
+            # Show Column search controls
+            self.column_label.grid(row=2, column=0, padx=(0, 10), pady=(10, 0), sticky="e")
+            self.column_input_entry.grid(row=2, column=1, sticky="ew", padx=(0, 10), pady=(10, 0))
+            self.grid_placeholder.grid(row=2, column=3)
+            
         else:
+            self.search_label.configure(text="Dashboard Name:")
             self.active_results_frame = self.results_frame_tables
+            
+            # Hide Column search controls safely
+            self.column_label.grid_remove()
+            self.column_input_entry.grid_remove()
+            self.grid_placeholder.grid_remove()
+            self.column_input_var.set("") # Clear column search state
             
         self.active_results_frame.grid(row=5, column=0, sticky="nsew", pady=(10, 0))
         
-        # 3. Restore text state for the newly selected mode
         self.is_selecting_suggestion = True
-        
-        # Explicitly delete native contents to clear the field
         self.search_input_entry.delete(0, 'end') 
-        
-        # Insert saved text if there is any
         saved_text = self.search_text_state[self.current_mode]
         if saved_text:
             self.search_input_entry.insert(0, saved_text)
             
         self.is_selecting_suggestion = False
-            
         self.search_input_entry.focus()
+        
+        self.current_search_results = []
+        self.export_csv_button.configure(state="disabled")
 
     def initialize_and_build_maps(self):
-        """Loads environment variables and builds the lineage maps in the background."""
         load_dotenv()
         grafana_url = os.getenv("GRAFANA_URL")
         api_token = os.getenv("GRAFANA_TOKEN")
         
         if not grafana_url or not api_token:
-            print("DEBUG: Missing URL or Token in .env file.")
             def _handle_missing_creds():
                 self.is_loading = False
                 self.status_indicator_label.configure(text="● Missing Credentials", text_color="#E74C3C")
@@ -524,41 +571,26 @@ class FlakeLensApp(ctk.CTk):
             self.lineage_mapper = GrafanaLineageMapper(grafana_url, api_token)
             self.lineage_mapper.build_dependency_maps(["ProdTech", "PRODUCTION"], self.update_loading_progress)
             
-            # Cache the full lists for fast autocomplete filtering
             self.all_table_names = sorted(list(self.lineage_mapper.table_to_dashboards_map.keys()))
             self.all_dashboard_names = sorted(list(self.lineage_mapper.dashboard_to_tables_map.keys()))
             
             self.after(0, self.enable_user_inputs)
-            print(f"DEBUG: Indexing complete! Tables mapped: {len(self.all_table_names)}")
-            print(f"DEBUG: Dashboards mapped: {len(self.all_dashboard_names)}")
         except Exception as e:
-            print(f"DEBUG: Fatal error during initialization: {e}")
             def _handle_fatal_error():
                 self.is_loading = False
                 self.status_indicator_label.configure(text="● Connection Failed", text_color="#E74C3C")
             self.after(0, _handle_fatal_error)
 
     def update_loading_progress(self, progress_ratio: float, current_count: int, total_count: int):
-        """Safely updates the GUI progress bar from the background worker thread."""
         def _update_ui():
-            # Calculate integer percentage
             percentage = int(progress_ratio * 100)
-            
-            # Update the physical bar
             self.loading_progress_bar.set(progress_ratio)
-            
-            # Update the rich UI text labels
             self.loading_percent_label.configure(text=f"{percentage}%")
             self.loading_detail_label.configure(text=f"{current_count} / {total_count} dashboards processed")
-            
         self.after(0, _update_ui)
 
     def enable_user_inputs(self):
-        """Unlocks the GUI once map building is complete."""
-        # Hide the entire enhanced loading block
         self.loading_container.grid_forget()
-        
-        # Kill the animation and set the label to connected
         self.is_loading = False
         self.status_indicator_label.configure(text="● Connected", text_color="#2ECC71")
         
@@ -567,21 +599,19 @@ class FlakeLensApp(ctk.CTk):
         self.search_input_entry.focus()
 
     def process_search_request(self, event=None):
-        """Routes the search logic to the currently active frame."""
         self.hide_suggestion_frame()
-        
         raw_search_term = self.search_text_var.get().strip().upper()
         
-        # NORMALIZE USER INPUT: Strip DB prefix before searching
+        self.current_search_results = []
+        self.current_searched_term = raw_search_term
+        self.export_csv_button.configure(state="disabled")
+        
         if self.current_mode == "Find Dashboards from Table" and raw_search_term:
             parts = raw_search_term.split('.')
             search_term = '.'.join(parts[-2:])
         else:
             search_term = raw_search_term
 
-        print(f"DEBUG: Executing Search | Mode: '{self.current_mode}' | Raw: '{raw_search_term}' | Normalized: '{search_term}'")
-        
-        # Clear ONLY the currently active results frame before populating
         for widget in self.active_results_frame.winfo_children():
             widget.destroy()
             
@@ -589,16 +619,77 @@ class FlakeLensApp(ctk.CTk):
             return
 
         if self.current_mode == "Find Dashboards from Table":
-            # --- MODE 1: Table -> Dashboards -> Panels ---
+            
+            requested_cols = []
+            standard_col_patterns = []
+            has_star_request = False
+            raw_col_input = self.column_input_var.get().strip()
+            
+            # Smart default: If raw_col_input exists, validate and build patterns.
+            if raw_col_input:
+                # STRICT VALIDATION: Look for items securely enclosed in single quotes
+                extracted_quotes = re.findall(r"'([^']+)'", raw_col_input)
+                
+                if not extracted_quotes:
+                    error_str = "Error: Invalid column format.\n\nColumn names must be wrapped in single quotes and separated by commas.\nExample: 'COL_A', '*'"
+                    empty_msg = ctk.CTkLabel(self.active_results_frame, text=error_str, text_color="#E74C3C", justify="left")
+                    empty_msg.pack(pady=20, padx=10, anchor="w")
+                    return
+                
+                requested_cols = [c.strip().upper() for c in extracted_quotes if c.strip()]
+                
+                # Pre-compile Standard Regex Patterns
+                for col in requested_cols:
+                    if col == '*':
+                        has_star_request = True
+                    else:
+                        standard_col_patterns.append(re.compile(r'\b' + re.escape(col) + r'\b', re.IGNORECASE))
+            
             matched_dashboards_with_sources = defaultdict(set)
             
             for table_name, dashboards_dict in self.lineage_mapper.table_to_dashboards_map.items():
                 if search_term in table_name or table_name.endswith(f".{search_term}"):
-                    for dashboard_name, ui_sources in dashboards_dict.items():
-                        matched_dashboards_with_sources[dashboard_name].update(ui_sources)
+                    
+                    # Dynamically build the strictly bound star pattern for this specific table
+                    star_pattern = None
+                    if has_star_request:
+                        base_table = table_name.split('.')[-1]
+                        # Regex: Match SELECT * but bounded by the target table without crossing into another SELECT block
+                        regex_str = r'\bSELECT\b(?:(?!\bFROM\b).)*?(?:[a-zA-Z0-9_]+\.)?\*(?:(?!\bSELECT\b).)*?\b' + re.escape(base_table) + r'\b'
+                        star_pattern = re.compile(regex_str, re.IGNORECASE | re.DOTALL)
+                        
+                    for dashboard_name, sources_and_sqls in dashboards_dict.items():
+                        
+                        for source_label, sql_query in sources_and_sqls:
+                            # If columns were requested, filter by them
+                            if requested_cols:
+                                # Clean the SQL: Strip block (/* */), inline (--), AND Aggregates like COUNT(*)
+                                clean_sql = re.sub(r'/\*.*?\*/', '', sql_query, flags=re.DOTALL)
+                                clean_sql = re.sub(r'--.*', '', clean_sql)
+                                clean_sql = re.sub(r'\b\w+\s*\(\s*\*\s*\)', 'FUNC_STAR', clean_sql) # Purges COUNT(*) etc.
+                                
+                                match_found = False
+                                
+                                # Check standard columns (OR Logic)
+                                if standard_col_patterns and any(p.search(clean_sql) for p in standard_col_patterns):
+                                    match_found = True
+                                # Check perfectly bounded star match 
+                                elif star_pattern and star_pattern.search(clean_sql):
+                                    match_found = True
+                                    
+                                if not match_found:
+                                    continue 
+                            
+                            matched_dashboards_with_sources[dashboard_name].add(source_label)
+                            self.current_search_results.append([table_name, dashboard_name, source_label])
             
             if not matched_dashboards_with_sources:
-                empty_msg = ctk.CTkLabel(self.active_results_frame, text=f"No dependencies found matching '{search_term}'.")
+                if requested_cols:
+                    msg_str = f"No dashboards use this column.\n\n(Searched for: {', '.join(requested_cols)})"
+                    empty_msg = ctk.CTkLabel(self.active_results_frame, text=msg_str, justify="left")
+                else:
+                    empty_msg = ctk.CTkLabel(self.active_results_frame, text=f"No dependencies found matching '{search_term}'.")
+                    
                 empty_msg.pack(pady=20, padx=10, anchor="w")
                 return
                 
@@ -609,13 +700,17 @@ class FlakeLensApp(ctk.CTk):
                 ui_sources_list = sorted(matched_dashboards_with_sources[dashboard_name])
                 self._render_table_search_result_accordion(self.active_results_frame, dashboard_name, ui_sources_list)
 
+            if self.current_search_results:
+                self.export_csv_button.configure(state="normal")
+
         else:
-            # --- MODE 2: Dashboard -> Panels -> Tables (Nested) ---
             matched_dashboards_with_tables = {}
-            
             for dashboard_name, sources_to_tables_dict in self.lineage_mapper.dashboard_to_tables_map.items():
                 if search_term in dashboard_name.upper():
                     matched_dashboards_with_tables[dashboard_name] = sources_to_tables_dict
+                    for panel_name, table_list in sources_to_tables_dict.items():
+                        for table_name in table_list:
+                            self.current_search_results.append([dashboard_name, panel_name, table_name])
             
             if not matched_dashboards_with_tables:
                 empty_msg = ctk.CTkLabel(self.active_results_frame, text=f"No dashboards found matching '{search_term}'.")
@@ -627,9 +722,11 @@ class FlakeLensApp(ctk.CTk):
 
             for dashboard_name, sources_to_tables_dict in sorted(matched_dashboards_with_tables.items()):
                 self._render_dashboard_search_result_accordion(self.active_results_frame, dashboard_name, sources_to_tables_dict)
+                
+            if self.current_search_results:
+                self.export_csv_button.configure(state="normal")
 
     def _render_table_search_result_accordion(self, parent_frame, dashboard_title, ui_sources):
-        """Creates a standard 1-level expandable accordion (Dashboard -> Panels)."""
         accordion_container = ctk.CTkFrame(parent_frame, fg_color="transparent")
         accordion_container.pack(fill="x", padx=5, pady=2)
         
@@ -659,7 +756,6 @@ class FlakeLensApp(ctk.CTk):
             item_label.pack(fill="x", padx=10, pady=2)
 
     def _render_dashboard_search_result_accordion(self, parent_frame, dashboard_title, sources_to_tables_dict):
-        """Creates a 2-level expandable accordion (Dashboard -> Panel -> Tables)."""
         dashboard_container = ctk.CTkFrame(parent_frame, fg_color="transparent")
         dashboard_container.pack(fill="x", padx=5, pady=2)
         
